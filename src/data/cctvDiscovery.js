@@ -241,8 +241,10 @@ export function reconcileAiRecords(aiRecords, candidates, area = {}) {
       name: typeof ai.name === 'string' && ai.name.trim() ? ai.name.trim() : candidate.name,
     };
     for (const key of ['headingDeg', 'pitchDeg', 'fovDeg', 'rangeM']) {
-      const v = Number(ai[key]);
-      if (Number.isFinite(v)) merged[key] = v;
+      // Only a genuine finite number overrides the published prior. Using
+      // Number() here would coerce null/''/[]/false to 0 (all finite) and let an
+      // AAIOS "headingDeg": null clobber the candidate's real pose with zero.
+      if (typeof ai[key] === 'number' && Number.isFinite(ai[key])) merged[key] = ai[key];
     }
     const record = toRegisteredRecord(merged, area);
     if (record) out.push(record);

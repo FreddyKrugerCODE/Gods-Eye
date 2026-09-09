@@ -164,15 +164,47 @@ export function parseAaiosCameras(payload) {
  * @returns {Array<object>}
  */
 function extractJsonArray(text) {
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  if (start === -1 || end === -1 || end <= start) return [];
-  try {
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    return Array.isArray(parsed) ? parsed.filter((x) => x && typeof x === 'object') : [];
-  } catch {
-    return [];
+  const s = String(text);
+  // Fast path: the whole payload is already a JSON array.
+  const trimmed = s.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const whole = JSON.parse(trimmed);
+      if (Array.isArray(whole)) return whole.filter((x) => x && typeof x === 'object');
+    } catch { /* fall through to the balanced scan */ }
   }
+  // Scan: for each '[', walk forward tracking bracket depth while respecting JSON
+  // string literals (so brackets inside quotes don't count), and JSON.parse the
+  // first balanced slice that yields an array. This finds the real array even
+  // when bracketed prose precedes it (e.g. `notes [x]: [{...}]`).
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '[') continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; continue; }
+      if (c === '[') { depth++; continue; }
+      if (c === ']') {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(s.slice(i, j + 1));
+            if (Array.isArray(parsed)) return parsed.filter((x) => x && typeof x === 'object');
+          } catch { /* not this candidate; fall out to the next '[' */ }
+          break;
+        }
+      }
+    }
+  }
+  return [];
 }
 
 /**
@@ -197,10 +229,13 @@ export async function aaiosNormalizeCameras({ area, candidates, fetchImpl, env }
   }
 
   const doFetch = typeof fetchImpl === 'function' ? fetchImpl : fetch;
-  const prompt = buildAaiosPrompt(area, candidates);
-  const { url, init } = buildAaiosRequest(cfg, prompt);
 
   try {
+    // Inside the try so a malformed area (or any prompt/request build error)
+    // resolves to the fallback path instead of throwing — honoring the
+    // "never throws" contract above.
+    const prompt = buildAaiosPrompt(area, candidates);
+    const { url, init } = buildAaiosRequest(cfg, prompt);
     const resp = await doFetch(url, { ...init, signal: AbortSignal.timeout(cfg.timeoutMs) });
     if (!resp || !resp.ok) {
       return { configured: true, ok: false, cameras: [], error: `AAIOS HTTP ${resp ? resp.status : 'no-response'}` };

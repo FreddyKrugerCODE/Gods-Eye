@@ -1170,9 +1170,16 @@ export async function discoverCctv(viewer, dataManager, args = {}) {
 
   const focusId = (injected.ids && injected.ids[0]) || cameras[0]?.id || null;
   let focused = null;
+  let focusNote = null;
   if (focusId && typeof cctv?.selectCamera === 'function' && cctv.selectCamera(focusId)) {
-    cctv.focusCamera?.(focusId, 1.8);
-    focused = focusId;
+    // Report focused only if the flight actually ran — focusCamera suppresses it
+    // in cockpit mode or while tracking holds the view.
+    const outcome = cctvVoiceFocusOutcome(cctv.focusCamera?.(focusId, 1.8), { cameraSelected: true });
+    if (outcome.ok) {
+      focused = focusId;
+    } else {
+      focusNote = outcome.error;
+    }
   } else if (typeof cctv?.focusNearest === 'function') {
     focused = cctv.focusNearest();
   }
@@ -1185,6 +1192,7 @@ export async function discoverCctv(viewer, dataManager, args = {}) {
     source: payload.source || 'fallback',
     aaios: payload.aaios || 'not-configured',
     focused,
+    ...(focusNote ? { focusNote } : {}),
     area,
   };
 }

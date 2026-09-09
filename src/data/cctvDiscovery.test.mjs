@@ -192,3 +192,36 @@ test('aaiosNormalizeCameras never throws on HTTP error', async () => {
   assert.equal(res.ok, false);
   assert.match(res.error, /422/);
 });
+
+test('aaiosNormalizeCameras never throws when fetch itself rejects (network/timeout)', async () => {
+  const env = { AAIOS_BASE_URL: 'http://aaios.local' };
+  const fetchImpl = async () => { throw new Error('ECONNREFUSED'); };
+  const res = await aaiosNormalizeCameras({ area: AUSTIN, candidates: [{ id: 'a', lat: 30.26, lon: -97.74 }], fetchImpl, env });
+  assert.equal(res.configured, true);
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.cameras, []);
+  assert.match(res.error, /ECONNREFUSED/);
+});
+
+test('reconcileAiRecords: a null/empty AI pose hint does NOT clobber the published pose', () => {
+  const candidates = [{ id: 'c', name: 'Cam', lat: 30.26, lon: -97.74, headingDeg: 130, fovDeg: 70 }];
+  const ai = [{ id: 'c', name: 'Cam', headingDeg: null, fovDeg: '', pitchDeg: -12 }];
+  const out = reconcileAiRecords(ai, candidates, AUSTIN);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].headingDeg, 130); // null did not overwrite with 0
+  assert.equal(out[0].fovDeg, 70);      // '' did not overwrite with 0
+  assert.equal(out[0].pitchDeg, -12);   // a real number is still accepted
+});
+
+test('reconcileAiRecords: duplicate AI ids collapse to the first occurrence', () => {
+  const candidates = [{ id: 'c', name: 'Cam', lat: 30.26, lon: -97.74 }];
+  const ai = [{ id: 'c', name: 'First' }, { id: 'c', name: 'Second' }];
+  const out = reconcileAiRecords(ai, candidates, AUSTIN);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].name, 'First');
+});
+
+test('parseAaiosCameras finds the real array even behind bracketed prose', () => {
+  assert.equal(parseAaiosCameras('notes [ignore me]: [{"id":"a"},{"id":"b"}]').length, 2);
+  assert.equal(parseAaiosCameras({ output: 'see [ref 1] and [ref 2]: [{"id":"z"}]' }).length, 1);
+});
