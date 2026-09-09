@@ -19,6 +19,15 @@
 # OPENSKY_CLIENT_SECRET=
 # LL2_API_TOKEN=
 
+# AAIOS — your own LLM/Codex backend, used to clean up and rank the public
+# cameras that "Discover cameras here" finds. Optional: leave blank and
+# discovery still works with a plain distance-ranked list. AAIOS_BASE_URL is
+# your server's address; AAIOS_API_PATH defaults to /v1/run if blank;
+# AAIOS_API_KEY is sent as a Bearer token and never reaches the browser.
+# AAIOS_BASE_URL=
+# AAIOS_API_PATH=
+# AAIOS_API_KEY=
+
 # Keep sharing off. The current supported Pinokio release logs successful
 # tunnel-login passcodes, so the launcher refuses to create a tunnel.
 PINOKIO_SHARE_CLOUDFLARE=false

@@ -174,6 +174,10 @@ test('no unchanged Realtime tool definition drifts silently', () => {
     'fly_to_location',
     'select_nearest_aircraft',
     'set_map_stack',
+    // Newly ADDED by the CCTV area-discovery feature (not an edit to an existing
+    // tool). Excluded here so the digest below still proves every PRE-EXISTING
+    // tool is byte-identical.
+    'discover_cctv',
   ]);
   const unchanged = realtimeTools()
     .filter((tool) => !TOUCHED.has(tool.name))

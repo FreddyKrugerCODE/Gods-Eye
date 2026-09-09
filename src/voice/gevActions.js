@@ -894,6 +894,10 @@ export function createGevActionRunner({ viewer, styleManager, dataManager, scene
       return controlScene(sceneDirector, args);
     }
 
+    if (name === 'discover_cctv') {
+      return discoverCctv(viewer, dataManager, args);
+    }
+
     if (name === 'control_cctv') {
       return controlCctv(dataManager, args, styleManager);
     }
@@ -1086,6 +1090,103 @@ function controlScene(sceneDirector, args = {}) {
     return { ok: true, action: 'control_scene', playing: scene.title, shots: scene.shots };
   }
   throw new Error(`Unknown scene action: ${args.action || 'missing'}`);
+}
+
+/**
+ * Discover PUBLIC cameras in the current view and register them for viewing.
+ *
+ * Derives the on-screen area from the Cesium camera, asks the backend
+ * (/api/cctv/discover) for the already-public cameras inside it — optionally
+ * cleaned/ranked by AAIOS — then drops the returned cameras into the live CCTV
+ * layer and focuses the nearest. Enables the CCTV layer if it was off. Only
+ * public, already-published cameras are ever surfaced.
+ *
+ * @param {Cesium.Viewer} viewer
+ * @param {object} dataManager
+ * @param {{label?:string, limit?:number}} [args]
+ * @returns {Promise<object>}
+ */
+export async function discoverCctv(viewer, dataManager, args = {}) {
+  const cctvEntry = dataManager?.layers?.get?.('cctv');
+  if (!cctvEntry) {
+    return { ok: false, action: 'discover_cctv', error: 'CCTV layer unavailable' };
+  }
+
+  // Current view rectangle (radians) → degree bounding box. Undefined when the
+  // globe does not fill the view (e.g. looking out at space).
+  const ellipsoid = viewer?.scene?.globe?.ellipsoid;
+  const rect = viewer?.camera?.computeViewRectangle?.(ellipsoid);
+  if (!rect) {
+    return { ok: false, action: 'discover_cctv', error: 'Point the view down at a place on the map first, then discover.' };
+  }
+  const area = {
+    south: Cesium.Math.toDegrees(rect.south),
+    west: Cesium.Math.toDegrees(rect.west),
+    north: Cesium.Math.toDegrees(rect.north),
+    east: Cesium.Math.toDegrees(rect.east),
+  };
+  const label = typeof args.label === 'string' ? args.label.trim().slice(0, 120) : '';
+
+  const qs = new URLSearchParams({
+    south: String(area.south),
+    west: String(area.west),
+    north: String(area.north),
+    east: String(area.east),
+  });
+  if (label) qs.set('label', label);
+  if (Number.isFinite(Number(args.limit))) qs.set('limit', String(Math.floor(Number(args.limit))));
+
+  let payload;
+  try {
+    const resp = await fetch(`/api/cctv/discover?${qs.toString()}`, { cache: 'no-store' });
+    payload = await resp.json();
+    if (!resp.ok || !payload?.ok) {
+      return { ok: false, action: 'discover_cctv', error: payload?.error || `discovery failed (HTTP ${resp.status})`, area };
+    }
+  } catch (error) {
+    return { ok: false, action: 'discover_cctv', error: String(error?.message || error), area };
+  }
+
+  const cameras = Array.isArray(payload.cameras) ? payload.cameras : [];
+  if (cameras.length === 0) {
+    return {
+      ok: true,
+      action: 'discover_cctv',
+      discovered: 0,
+      source: payload.source || 'none',
+      note: payload.note || 'No public cameras found in this area.',
+      area,
+    };
+  }
+
+  // Ensure the layer is on (this also runs its one-time init, which loads the
+  // now-registered cameras from /api/cctv/sources), then inject live so already-
+  // initialized sessions see them without a reload.
+  if (!dataManager.isEnabled('cctv')) {
+    await dataManager.setEnabled('cctv', true, { origin: 'voice' });
+  }
+  const cctv = cctvEntry.module || dataManager.layers.get('cctv')?.module;
+  const injected = cctv?.addDiscoveredCameras?.(cameras) || { added: 0, ids: [] };
+
+  const focusId = (injected.ids && injected.ids[0]) || cameras[0]?.id || null;
+  let focused = null;
+  if (focusId && typeof cctv?.selectCamera === 'function' && cctv.selectCamera(focusId)) {
+    cctv.focusCamera?.(focusId, 1.8);
+    focused = focusId;
+  } else if (typeof cctv?.focusNearest === 'function') {
+    focused = cctv.focusNearest();
+  }
+
+  return {
+    ok: true,
+    action: 'discover_cctv',
+    discovered: cameras.length,
+    injected: injected.added,
+    source: payload.source || 'fallback',
+    aaios: payload.aaios || 'not-configured',
+    focused,
+    area,
+  };
 }
 
 /** Voice CCTV control over the cctv layer module's public surface. */
