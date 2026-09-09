@@ -75,6 +75,18 @@ import {
   validTerrainResult,
 } from './src/data/terrainHeightsProxy.js';
 import { VOICE_MODELS, isKnownVoiceTier, resolveVoiceModel } from './src/voice/voiceCost.js';
+// CCTV area-discovery feature (discover → place → view). AAIOS is the operator's
+// optional LLM backend; when unset, discovery falls back to a deterministic
+// pass-through of the public candidate cameras.
+import { aaiosNormalizeCameras } from './src/server/aaios.js';
+import {
+  normalizeArea,
+  filterCandidatesToArea,
+  toRegisteredRecord,
+  reconcileAiRecords,
+  DISCOVERY_DEFAULT_MAX,
+  DISCOVERY_HARD_MAX,
+} from './src/data/cctvDiscovery.js';
 
 /** Resolve __dirname for ESM context. */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -3561,6 +3573,11 @@ let _cctvSourceCacheAt = 0;
 /** @type {Promise<Array<object>>|null} In-flight refresh, shared by concurrent
  * callers so a post-TTL burst launches ONE refetch, not one per request. */
 let _cctvSourceInflight = null;
+/** @type {Array<object>} Cameras registered at runtime by the area-discovery
+ * route (/api/cctv/discover). Merged on top of the pack/file/env catalog by
+ * mergeDiscoveredSources so they appear in /api/cctv/sources without a pack
+ * refetch. Normalized (via normalizeSourceItem) before they land here. */
+let _discoveredCctvSources = [];
 
 /**
  * Coerce a value to a finite number, returning fallback if NaN/Infinity.
@@ -4213,7 +4230,7 @@ function normalizeSourceItem(item) {
  *
  * @returns {Promise<Array<object>>} Deduplicated, capped source list.
  */
-async function getCctvSources() {
+async function getCctvBaseSources() {
   const now = Date.now();
   if (_cctvSourceCache.length && now - _cctvSourceCacheAt <= CCTV_SOURCE_CACHE_MS) {
     return _cctvSourceCache;
@@ -4224,6 +4241,192 @@ async function getCctvSources() {
   if (_cctvSourceInflight) return _cctvSourceInflight;
   _cctvSourceInflight = refreshCctvSources().finally(() => { _cctvSourceInflight = null; });
   return _cctvSourceInflight;
+}
+
+/**
+ * Overlay runtime-discovered cameras on top of the pack/file/env catalog.
+ * Discovered entries win on duplicate IDs (they carry operator-approved poses),
+ * and the combined list is re-capped so discovery can never exceed the global
+ * source cap. Pure/synchronous — no network, no cache mutation.
+ *
+ * @param {Array<object>} base - The pack/file/env source list.
+ * @returns {Array<object>} base ∪ discovered, deduped by id, capped.
+ */
+function mergeDiscoveredSources(base) {
+  if (!_discoveredCctvSources.length) return base;
+  const byId = new Map();
+  for (const item of base) if (item && item.id) byId.set(item.id, item);
+  for (const item of _discoveredCctvSources) if (item && item.id) byId.set(item.id, item);
+  const merged = Array.from(byId.values());
+  const maxRaw = Number(process.env.CCTV_MAX_SOURCES || DEFAULT_CCTV_MAX_SOURCES);
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(1200, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  return merged.length > maxCount ? merged.slice(0, maxCount) : merged;
+}
+
+/**
+ * Public source list served to every CCTV route: the cached pack/file/env
+ * catalog with any runtime-discovered cameras overlaid.
+ *
+ * @returns {Promise<Array<object>>} Deduplicated, capped source list.
+ */
+async function getCctvSources() {
+  const base = await getCctvBaseSources();
+  return mergeDiscoveredSources(base);
+}
+
+/**
+ * Register runtime-discovered cameras so they appear in /api/cctv/sources.
+ *
+ * Each record is passed through the same normalizer as every other source,
+ * de-duplicated by id against prior discoveries (last write wins), and capped.
+ * Records without an id or finite coordinates are dropped. Returns the records
+ * that were actually registered (post-normalization).
+ *
+ * SAFETY: callers only ever pass cameras derived from already-public candidates
+ * (see /api/cctv/discover). This function performs no fetching and stores no
+ * upstream URL that the frame proxy would treat as fetchable beyond what the
+ * public catalog already declared.
+ *
+ * @param {Array<object>} records
+ * @returns {Array<object>} Normalized, registered records.
+ */
+function addDiscoveredCctvSources(records) {
+  const byId = new Map(_discoveredCctvSources.map((r) => [r.id, r]));
+  const added = [];
+  for (const raw of Array.isArray(records) ? records : []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const normalized = normalizeSourceItem(raw);
+    if (!normalized.id || !Number.isFinite(normalized.lat) || !Number.isFinite(normalized.lon)) continue;
+    byId.set(normalized.id, normalized);
+    added.push(normalized);
+  }
+  // Cap the discovered overlay itself so a runaway caller can't grow it without
+  // bound; keep the most-recently-registered entries.
+  const all = Array.from(byId.values());
+  _discoveredCctvSources = all.length > DISCOVERY_HARD_MAX ? all.slice(all.length - DISCOVERY_HARD_MAX) : all;
+  return added;
+}
+
+/**
+ * Read a small JSON request body (bounded), returning {} on any problem. Used
+ * only by the discovery route's optional POST form.
+ *
+ * @param {import('http').IncomingMessage} req
+ * @param {number} [maxBytes=8192]
+ * @returns {Promise<object>}
+ */
+function readBoundedJsonBody(req, maxBytes = 8192) {
+  return new Promise((resolve) => {
+    let size = 0;
+    const chunks = [];
+    let aborted = false;
+    req.on('data', (chunk) => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > maxBytes) { aborted = true; resolve({}); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      try {
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        const parsed = text ? JSON.parse(text) : {};
+        resolve(parsed && typeof parsed === 'object' ? parsed : {});
+      } catch { resolve({}); }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+/**
+ * Vite plugin: CCTV area-discovery route.
+ *
+ *   GET|POST /api/cctv/discover?south&west&north&east[&label][&limit]
+ *
+ * Pipeline: take the already-public camera catalog (getCctvSources), keep the
+ * ones inside the requested area, ask AAIOS (task_class 'extract', quality
+ * 'standard') to clean/rank them, fall back to a deterministic pass-through
+ * when AAIOS is absent or unhelpful, then register the survivors so they show
+ * up in /api/cctv/sources. This never fetches an arbitrary URL and never
+ * surfaces a non-public camera — it only re-scopes and labels published feeds.
+ *
+ * @returns {import('vite').Plugin}
+ */
+function cctvDiscoveryProxy() {
+  return {
+    name: 'cctv-discovery-proxy',
+    configureServer(server) {
+      server.middlewares.use('/api/cctv/discover', async (req, res) => {
+        const sendJson = (status, body) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end(JSON.stringify(body));
+        };
+        try {
+          if (req.method !== 'GET' && req.method !== 'POST') {
+            return sendJson(405, { ok: false, error: 'Method not allowed' });
+          }
+
+          const url = new URL(req.url || '/', 'http://localhost');
+          const params = {};
+          for (const key of ['south', 'west', 'north', 'east', 'label', 'limit']) {
+            if (url.searchParams.has(key)) params[key] = url.searchParams.get(key);
+          }
+          if (req.method === 'POST') {
+            const body = await readBoundedJsonBody(req);
+            for (const key of ['south', 'west', 'north', 'east', 'label', 'limit']) {
+              if (body[key] !== undefined) params[key] = body[key];
+            }
+          }
+
+          const area = normalizeArea(params);
+          if (!area) {
+            return sendJson(400, { ok: false, error: 'Invalid area — provide numeric south, west, north, east (degrees).' });
+          }
+          const limit = Math.max(1, Math.min(
+            DISCOVERY_HARD_MAX,
+            Math.floor(Number(params.limit) || DISCOVERY_DEFAULT_MAX),
+          ));
+
+          const catalog = await getCctvSources();
+          const candidates = filterCandidatesToArea(catalog, area, { max: limit });
+          if (candidates.length === 0) {
+            return sendJson(200, {
+              ok: true, area, count: 0, source: 'none', aaios: 'skipped', cameras: [],
+              note: 'No public cameras published for this area. Point the view at a covered city (e.g. Austin, London, or California) or configure CCTV_SOURCES_FILE.',
+            });
+          }
+
+          // AAIOS cleans/ranks the public candidates; reconcile guards against
+          // any hallucinated id and keeps published coords/URLs authoritative.
+          const ai = await aaiosNormalizeCameras({ area, candidates });
+          let records = [];
+          let source = 'fallback';
+          if (ai.configured && ai.ok && ai.cameras.length) {
+            records = reconcileAiRecords(ai.cameras, candidates, area);
+            if (records.length) source = 'aaios';
+          }
+          if (!records.length) {
+            records = candidates.map((c) => toRegisteredRecord(c, area)).filter(Boolean);
+            source = 'fallback';
+          }
+
+          const registered = addDiscoveredCctvSources(records);
+          return sendJson(200, {
+            ok: true,
+            area,
+            count: registered.length,
+            source,
+            aaios: ai.configured ? (ai.ok ? 'ok' : (ai.error || 'no-usable-output')) : 'not-configured',
+            cameras: registered,
+          });
+        } catch (error) {
+          return sendJson(500, { ok: false, error: String(error && error.message ? error.message : error) });
+        }
+      });
+    },
+  };
 }
 
 /**
@@ -6028,6 +6231,19 @@ const GEV_REALTIME_TOOLS = [
   },
   {
     type: 'function',
+    name: 'discover_cctv',
+    description: 'Discover PUBLIC cameras in the area currently in view and register them so they can be watched. Use when the user asks to find/search/look for cameras "here", "in this area", "around here", or at the place on screen. Finds only already-published public cameras (never private/unsecured ones), drops them on the map at their real locations, and focuses the nearest one. Enables the CCTV layer if needed. After discovery, use control_cctv (nearest/next/select/focus) to move between the cameras.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        label: { type: 'string', description: 'Optional human name for the area (e.g. "Austin downtown"); used for labeling only. The area itself is taken from the current view.' },
+        limit: { type: 'number', description: 'Optional cap on how many cameras to register (default 40).' },
+      },
+    },
+  },
+  {
+    type: 'function',
     name: 'control_cctv',
     description: 'CCTV camera operations: enable/disable the layer, select a camera by name, next/prev/nearest/focus, toggle coverage wedges / projection overlay / auto-hop, "viewshed" for color-coded per-camera coverage volumes, and "adjust" for the on-camera calibration gizmo.',
     parameters: {
@@ -7751,6 +7967,10 @@ export default defineConfig(({ mode }) => {
       militaryInstallationsProxy(),
       regionalBriefProxy(),
       weatherEffectsProxy(),
+      // Discovery is registered BEFORE cctvProxy: its mount ('/api/cctv/discover')
+      // is more specific, so connect routes /discover here and leaves every other
+      // /api/cctv/* path to cctvProxy below.
+      cctvDiscoveryProxy(),
       cctvProxy(),
       radioBrowserProxy(),
       gbfsProxy(),

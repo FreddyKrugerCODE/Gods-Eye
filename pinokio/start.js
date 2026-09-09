@@ -22,6 +22,9 @@ module.exports = {
           PINOKIO_SHARE_VAR: '{{env.PINOKIO_SHARE_VAR || "__gev_sharing_disabled__"}}',
           GEV_RATELIMIT_OPENAI_PER_MIN: '{{env.GEV_RATELIMIT_OPENAI_PER_MIN || ""}}',
           GEV_RATELIMIT_GOOGLE_PER_MIN: '{{env.GEV_RATELIMIT_GOOGLE_PER_MIN || ""}}',
+          AAIOS_BASE_URL: '{{env.AAIOS_BASE_URL || ""}}',
+          AAIOS_API_PATH: '{{env.AAIOS_API_PATH || ""}}',
+          AAIOS_API_KEY: '{{env.AAIOS_API_KEY || ""}}',
         },
         message: 'node scripts/pinokio-start.mjs',
         on: [{

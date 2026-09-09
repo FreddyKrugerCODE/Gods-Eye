@@ -1,0 +1,30 @@
+Gods-Eye
+========
+
+This repository is built on top of "God's Eye View" by Bilawal Sidhu,
+used under the MIT License.
+
+  Upstream project : God's Eye View
+  Author           : Bilawal Sidhu
+  Source           : https://github.com/bilawalsidhu/gods-eye-view
+  License          : MIT (see LICENSE)
+  Vendored at commit: 7596522 (imported as the base application)
+
+The upstream tree is included largely unmodified. Additions made on top of it
+for this project:
+
+  * A CCTV "discover → place → view" feature: point the map at an area, have
+    the app find the PUBLIC cameras already published for that area, register
+    them at their real locations, and watch through them.
+      - src/data/cctvDiscovery.js        (pure area/candidate logic)
+      - src/server/aaios.js              (optional AAIOS LLM backend client)
+      - vite.config.js                   (/api/cctv/discover route + registry)
+      - src/data/cctv.js                 (addDiscoveredCameras live-inject method)
+      - src/voice/gevActions.js          (discover_cctv action)
+      - docs/CCTV-DISCOVERY.md           (how it works and how to wire AAIOS)
+
+  * Pinokio + .env plumbing to pass AAIOS_* settings through to the app.
+
+These additions do not add face recognition, motion alerts, analytics, or any
+camera capability beyond discover-access-place-view, and they surface only
+already-public cameras.

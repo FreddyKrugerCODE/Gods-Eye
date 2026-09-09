@@ -4820,6 +4820,71 @@ const cctvLayer = {
     }
     return nearest;
   },
+
+  /**
+   * Add runtime-discovered cameras to the live catalog WITHOUT tearing down the
+   * existing scene (additive-only, matching the rest of this module). Each new
+   * camera gets the same billboard + record treatment as init(); cameras whose
+   * id is already present are skipped. Frustum/coverage geometry is built lazily
+   * by the existing geometry queue on the next enable/coverage pass.
+   *
+   * If the layer has not been initialized yet, this is a no-op with
+   * `pending:true` — enabling the layer will pick the cameras up from
+   * /api/cctv/sources (which now includes them) on its normal init path.
+   *
+   * @param {Object[]} rawSources - Source objects (same shape as /api/cctv/sources).
+   * @returns {{added:number, ids:string[], pending?:boolean}}
+   */
+  addDiscoveredCameras(rawSources) {
+    if (!_viewer || !_billboards) return { added: 0, ids: [], pending: true };
+    const catalog = buildCatalogFromSources(rawSources);
+    const ids = [];
+    for (const camera of catalog) {
+      if (!camera || !camera.id || _recordById.has(camera.id)) continue;
+      ensureCameraPose(camera);
+      const priorGround = Number(camera.groundElevationM) || 0;
+      camera.absoluteHeightM = priorGround + (Number(camera.mountHeightM) || 0);
+      const position = Cesium.Cartesian3.fromDegrees(camera.lon, camera.lat, camera.absoluteHeightM);
+      const billboard = _billboards.add({
+        id: camera.id,
+        image: CAMERA_ICON,
+        position,
+        color: IDLE_CAMERA_COLOR,
+        width: 24,
+        height: 24,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        scaleByDistance: new Cesium.NearFarScalar(350, 1.25, 4_000_000, 0.42),
+      });
+      const record = {
+        camera,
+        position,
+        billboard,
+        coverageEntities: [],
+        projection: null,
+        groundPrior: null,
+        groundResolved: {},
+        groundSamples: {},
+        frustumGeometry: null,
+        frustumPositions: null,
+        probeClampRangeM: null,
+        viewshedColors: viewshedColors(cameraHue(_records.length)),
+        viewshedPrimitive: null,
+        viewshedActiveTint: false,
+      };
+      _records.push(record);
+      _recordById.set(camera.id, record);
+      ids.push(camera.id);
+    }
+    _count = _records.length;
+    if (!_activeCameraId && _records.length > 0) {
+      _activeCameraId = _records[0].camera.id;
+    }
+    if (ids.length > 0) {
+      refreshHorizonCulling();
+      notifyListeners();
+    }
+    return { added: ids.length, ids };
+  },
 };
 
 export default cctvLayer;
